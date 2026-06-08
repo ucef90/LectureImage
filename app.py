@@ -26,6 +26,8 @@ from pathlib import Path
 
 import streamlit as st
 from PIL import Image, ImageOps
+
+import name_corrector
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -56,35 +58,63 @@ WARNING_BANNER = (
 # Modèles par défaut pour chaque backend (modifiables dans la sidebar)
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"        # Le moins cher d'Anthropic
 DEFAULT_MISTRAL_MODEL = "pixtral-12b-2409"       # Modèle vision Mistral
-DEFAULT_OLLAMA_MODEL = "moondream:1.8b"          # Modèle vision local rapide pour CPU (PC sans GPU)
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:3b"             # Vision LLM local — bon compromis qualité/vitesse CPU
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+ENABLE_RAG_CORRECTION = True                      # Active la correction post-LLM via base de noms
 
 ACCEPTED_IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
 
-# ============================================================================
-# PROMPT LLM — Pièce maîtresse, modifiable ici sans toucher au reste du code
-# ============================================================================
 
 EXTRACTION_PROMPT = """\
-Tu lis un document manuscrit en français et tu extrais 3 informations DEPUIS L'IMAGE.
+Tu es un expert en lecture d'écriture manuscrite française (cursive et script).
+Tu lis un document manuscrit et tu extrais 3 informations DEPUIS L'IMAGE.
 
-Champs à extraire (uniquement ce que tu vois dans l'image, jamais d'invention) :
-- nom     : le nom de famille manuscrit dans l'image
-- prenom  : le prénom manuscrit dans l'image
-- age     : l'âge manuscrit (avec "ans" si présent)
+STRATÉGIE DE LECTURE
+1. L'image peut être pivotée (photo prise au téléphone) : analyse-la dans toutes
+   les orientations possibles avant de répondre.
+2. Repère d'abord les libellés écrits : "Nom", "Prénom", "Prenom", "Age", "Âge",
+   "age :", parfois suivis de ":" ou "=". La valeur est juste à droite ou en dessous.
+3. Lis la valeur lettre par lettre, en tenant compte des particularités cursives :
+   - "EL", "AL", "BEN", "DA", "DE", "VAN" sont des préfixes de noms courants.
+   - Les noms peuvent être en MAJUSCULES, les prénoms en minuscules cursives.
+   - Le "Y" cursif a une grande boucle descendante, le "J" aussi.
+   - Le "ss" double français peut ressembler à un "ff" ou "ll".
+4. Si tu hésites entre 2 lectures, choisis la plus plausible comme nom/prénom
+   français ou maghrébin/européen courant, mais ne devine PAS si c'est illisible.
 
-Si un champ est absent, illisible ou douteux, écris exactement la chaîne : non détecté
+CHAMPS À EXTRAIRE (uniquement ce que tu vois, jamais d'invention)
+- nom     : nom de famille manuscrit (souvent en MAJUSCULES)
+- prenom  : prénom manuscrit (souvent en minuscules cursives)
+- age     : âge manuscrit, nombre seul ou avec "ans"
 
-Évalue ta confiance globale :
+Si un champ est absent, illisible ou douteux, écris exactement : non détecté
+
+ÉVALUATION DE CONFIANCE
 - élevée  : les 3 champs sont lisibles sans ambiguïté
 - moyenne : au moins un champ est partiellement lisible
 - faible  : plusieurs champs sont illisibles
 
+EXEMPLES (apprends le format de sortie, pas les valeurs)
+
+Exemple 1 — image contenant : "age : 43   Nom : EL MOUTEE   Prénom : Youssef"
+{"nom": "EL MOUTEE", "prenom": "Youssef", "age": "43", "confiance": "élevée", "remarques": ""}
+
+Exemple 2 — image contenant : "Nom : DUPONT   Prénom : Marie   Âge : 28 ans"
+{"nom": "DUPONT", "prenom": "Marie", "age": "28 ans", "confiance": "élevée", "remarques": ""}
+
+Exemple 3 — image avec nom lisible mais âge raturé :
+{"nom": "MARTIN", "prenom": "Jean", "age": "non détecté", "confiance": "moyenne", "remarques": "âge raturé"}
+
+Exemple 4 — image vide ou illisible :
+{"nom": "non détecté", "prenom": "non détecté", "age": "non détecté", "confiance": "faible", "remarques": "document illisible"}
+
+FORMAT DE SORTIE
 Réponds UNIQUEMENT avec un objet JSON contenant ces 5 clés exactes :
 nom, prenom, age, confiance, remarques
 
-Les valeurs nom, prenom, age sont celles LUES DANS L'IMAGE (jamais des exemples).
-La clé remarques contient une courte note libre (max 100 caractères) ou une chaîne vide.
+Les valeurs nom, prenom, age sont celles LUES DANS L'IMAGE FOURNIE (jamais des
+exemples ci-dessus, qui sont là pour illustrer le format).
+La clé remarques contient une courte note libre (max 100 caractères) ou "".
 
 Réponse = un seul objet JSON, commence par { et termine par }. Rien d'autre.
 """
@@ -100,19 +130,28 @@ def encode_image_to_base64(image_bytes: bytes) -> str:
 
 def resize_image_for_llm(image_bytes: bytes, max_size: int = MAX_IMAGE_SIZE_PX) -> bytes:
     """
-    Redimensionne l'image avant envoi au LLM.
-    Corrige l'orientation EXIF (photos tournées par le téléphone),
-    limite le côté le plus long à max_size pixels et ré-encode en JPEG.
-    Gain de performance majeur, surtout sur Ollama CPU.
+    Pré-traite l'image avant envoi au LLM (étapes critiques pour la cursive) :
+    1. Corrige l'orientation EXIF (photos tournées par le téléphone)
+    2. Limite le côté le plus long à max_size pixels
+    3. Convertit en niveaux de gris puis renforce le contraste (auto-contrast)
+       → le trait à l'encre ressort beaucoup mieux contre le papier
+    4. Repasse en RGB et ré-encode en JPEG haute qualité
+    Gain de fiabilité majeur sur Vision LLM local + gain de performance.
     """
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size), Image.LANCZOS)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    # Renforcement du contraste : étape clé pour les Vision LLM locaux sur manuscrit.
+    # On passe en L (niveaux de gris) → autocontrast → retour en RGB.
+    if img.mode != "L":
+        gray = img.convert("L")
+    else:
+        gray = img
+    gray = ImageOps.autocontrast(gray, cutoff=2)
+    img = gray.convert("RGB")
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=88, optimize=True)
+    img.save(out, format="JPEG", quality=92, optimize=True)
     return out.getvalue()
 
 
@@ -249,7 +288,12 @@ def call_ollama(image_bytes: bytes, model: str, host: str):
             }
         ],
         format="json",
-        options={"temperature": 0.0},
+        options={
+            "temperature": 0.0,
+            "num_predict": 300,     # plafond tokens — suffisant pour JSON court
+            "num_ctx": 4096,        # contexte modeste, accélère CPU
+            "top_p": 0.1,           # quasi-déterministe
+        },
         keep_alive="15m",
     )
     raw_text = response["message"]["content"]
@@ -409,7 +453,8 @@ def render_sidebar() -> dict:
             config["model"] = st.text_input(
                 "Modèle Ollama",
                 value=DEFAULT_OLLAMA_MODEL,
-                help="À installer via : ollama pull qwen2.5vl:7b",
+                help="À installer via : ollama pull qwen2.5vl:3b (~2 Go, CPU OK). "
+                     "Alternatives : moondream:latest (plus rapide), minicpm-v (plus précis mais lent).",
             )
             config["host"] = st.text_input(
                 "Serveur Ollama",
@@ -417,11 +462,24 @@ def render_sidebar() -> dict:
             )
 
         st.markdown("---")
+        st.subheader("Correction RAG")
+        config["enable_rag"] = st.checkbox(
+            "Corriger via base de noms",
+            value=ENABLE_RAG_CORRECTION,
+            help="Applique un fuzzy match contre data/prenoms_fr.txt et data/noms_fr.txt "
+                 "pour rattraper les erreurs de lecture du LLM.",
+        )
+        stats = name_corrector.database_stats()
+        st.caption(
+            f"Base chargée : **{stats['prenoms']}** prénoms · **{stats['noms']}** noms"
+        )
+
+        st.markdown("---")
         st.caption(
             "Flux de travail :\n"
             "1. Charger une image\n"
-            "2. Extraire avec l'IA\n"
-            "3. Vérifier / corriger\n"
+            "2. Extraire avec l'IA (+ correction RAG)\n"
+            "3. Vérifier / corriger manuellement\n"
             "4. Valider (ajout au lot)\n"
             "5. Recommencer ou télécharger le PDF"
         )
@@ -445,18 +503,27 @@ def confidence_badge(level: str) -> str:
 
 
 def run_extraction(image_bytes: bytes, config: dict):
-    """Aiguille l'appel vers le bon backend selon la config sidebar."""
+    """
+    Aiguille l'appel vers le bon backend selon la config sidebar,
+    puis applique la correction RAG via la base de noms locale.
+    """
     image_bytes = resize_image_for_llm(image_bytes)
     backend = config["backend"]
     if backend == "Claude (Anthropic)":
         if not config.get("api_key"):
             raise ValueError("Clé API Anthropic manquante (à saisir dans la sidebar).")
-        return call_claude(image_bytes, config["api_key"], config["model"])
-    if backend == "Mistral (Pixtral)":
+        extraction, raw = call_claude(image_bytes, config["api_key"], config["model"])
+    elif backend == "Mistral (Pixtral)":
         if not config.get("api_key"):
             raise ValueError("Clé API Mistral manquante (à saisir dans la sidebar).")
-        return call_mistral(image_bytes, config["api_key"], config["model"])
-    return call_ollama(image_bytes, config["model"], config["host"])
+        extraction, raw = call_mistral(image_bytes, config["api_key"], config["model"])
+    else:
+        extraction, raw = call_ollama(image_bytes, config["model"], config["host"])
+
+    # RAG correctif : fuzzy match contre data/prenoms_fr.txt + data/noms_fr.txt
+    if config.get("enable_rag", ENABLE_RAG_CORRECTION):
+        extraction = name_corrector.apply_corrections(extraction)
+    return extraction, raw
 
 
 def main():
@@ -525,7 +592,31 @@ def main():
 
             with st.form(key="validation_form"):
                 nom_value = st.text_input("Nom de famille", value=extraction["nom"])
+                if extraction.get("nom_corrige"):
+                    st.caption(
+                        f"🔧 Corrigé via base : *{extraction['nom_lu']}* → "
+                        f"**{extraction['nom']}** ({extraction.get('nom_score', 0):.0f}%)"
+                    )
+                elif extraction.get("nom_lu") and extraction["nom_lu"] not in ("", "non détecté"):
+                    score = extraction.get("nom_score", 0)
+                    if score >= 95:
+                        st.caption(f"✅ Lu directement, présent en base ({score:.0f}%)")
+                    elif score > 0:
+                        st.caption(f"⚠️ Lu mais absent de la base (meilleur match {score:.0f}%)")
+
                 prenom_value = st.text_input("Prénom", value=extraction["prenom"])
+                if extraction.get("prenom_corrige"):
+                    st.caption(
+                        f"🔧 Corrigé via base : *{extraction['prenom_lu']}* → "
+                        f"**{extraction['prenom']}** ({extraction.get('prenom_score', 0):.0f}%)"
+                    )
+                elif extraction.get("prenom_lu") and extraction["prenom_lu"] not in ("", "non détecté"):
+                    score = extraction.get("prenom_score", 0)
+                    if score >= 95:
+                        st.caption(f"✅ Lu directement, présent en base ({score:.0f}%)")
+                    elif score > 0:
+                        st.caption(f"⚠️ Lu mais absent de la base (meilleur match {score:.0f}%)")
+
                 age_value = st.text_input("Âge", value=extraction["age"])
                 if extraction.get("remarques"):
                     st.caption(f"Remarques IA : *{extraction['remarques']}*")
